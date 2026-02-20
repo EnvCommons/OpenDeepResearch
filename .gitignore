@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+*.jsonl
+.DS_Store
+.claude/
