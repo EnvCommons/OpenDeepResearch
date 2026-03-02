@@ -78,8 +78,6 @@ The ArenaRL paper evaluates models on Open-DeepResearch using pairwise win rates
 | Claude-3.7-Sonnet | 19.1% | 89.0% |
 | GPT-4o | 12.2% | 88.0% |
 
-Traditional RL methods struggle with long-horizon research tasks due to "length bias", often producing unusable outputs (17–32% valid generation rate).
-
 ## Other Environment Requirements
 
 - **OpenAI API key**: Required for 7-dimension rubric grading via gpt-5-mini
