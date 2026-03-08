@@ -62,6 +62,8 @@ Source: [Alibaba-NLP/Open-DeepResearch](https://huggingface.co/datasets/Alibaba-
 | `fetch_url` | Fetch content from a specific URL (max 12,000 characters). |
 | `submit_report` | Submit a research report with key findings, cited sources, and confidence score. |
 
+Note that the `fetch_url` and `web_search` tools require Tavily, but are optional. If you want to use a different provider for search you can exclude these tools and use external tools instead.
+
 ## Time Horizon
 
 Open-DeepResearch is a multi-turn environment. Agents perform multiple rounds of web search and content fetching before compiling and submitting a research report.
