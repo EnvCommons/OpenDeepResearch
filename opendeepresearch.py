@@ -22,7 +22,7 @@ import openai
 from pydantic import BaseModel, Field
 from tavily import AsyncTavilyClient
 
-from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, tool
+from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, terminal, tool
 
 from constants import TRAIN_JSONL, TEST_JSONL
 
@@ -47,27 +47,15 @@ class FetchUrlInput(BaseModel):
 
 
 class SubmitReportInput(BaseModel):
-    """Parameters for submit_report tool"""
+    """Parameters for the terminal grading tool.
+
+    Under @terminal, the assistant's final message becomes `report`. The whole
+    reply is graded by the ArenaRL 7-dimension judge, so the report itself
+    must include the Key Findings and Sources sections inline.
+    """
     report: str = Field(
         ...,
-        description="Comprehensive research report (minimum 500 characters, maximum 10,000)"
-    )
-    key_findings: List[str] = Field(
-        ...,
-        description="List of 3-10 key findings from research",
-        min_length=3,
-        max_length=10
-    )
-    sources_cited: List[str] = Field(
-        ...,
-        description="List of URLs used as sources (minimum 1)",
-        min_length=1
-    )
-    confidence: float = Field(
-        ...,
-        ge=0.0,
-        le=1.0,
-        description="Confidence in report quality (0.0 to 1.0)"
+        description="Comprehensive research report (minimum 500 characters). Include Key Findings and Sources sections inline."
     )
 
 
@@ -81,18 +69,16 @@ CHINESE_INSTRUCTIONS = """您的任务是对这个研究问题进行深入调查
 2. fetch_url(url: str) - 获取特定URL的完整内容
    - 在web_search之后使用此工具阅读完整页面
    - 有助于提取详细信息
-3. submit_report(...) - 提交最终研究报告（结束任务）
 
 说明:
 1. 使用web_search查找相关信息
    - 考虑搜索问题中提到的关键实体、日期或概念
    - 问题通常需要跨多个搜索的多跳推理
 2. 使用fetch_url获取有价值URL的完整内容
-3. 准备好后，使用submit_report提交:
-   - report: 全面的研究报告（至少500字符，最多10,000字符）
-   - key_findings: 3-10个关键发现列表
-   - sources_cited: 使用的URL列表（至少1个）
-   - confidence: 您的信心水平（0.0到1.0）
+3. 准备好后，请以普通消息形式回复您的完整研究报告（不要调用任何工具）。您的整条回复将作为报告进行评分，因此请在报告中直接包含以下内容：
+   - 全面的报告正文（至少500字符）
+   - "关键发现"部分，包含3-10个要点
+   - "参考来源"部分，包含至少1个URL
 
 重要提示: 这个问题需要深入研究。请充分调查后再提交报告。"""
 
@@ -106,18 +92,16 @@ Available Tools:
 2. fetch_url(url: str) - Fetch full content from a specific URL
    - Use after web_search to read complete pages
    - Helpful for extracting detailed information
-3. submit_report(...) - Submit your final research report (ends task)
 
 Instructions:
 1. Use web_search to find relevant information
    - Consider searching for key entities, dates, or concepts mentioned
    - Questions often require multi-hop reasoning across multiple searches
 2. Use fetch_url to get complete content from promising URLs
-3. When ready, use submit_report with:
-   - report: Comprehensive research report (minimum 500 characters, maximum 10,000)
-   - key_findings: List of 3-10 key findings
-   - sources_cited: List of URLs used as sources (minimum 1)
-   - confidence: Your confidence level (0.0 to 1.0)
+3. When ready, reply with your comprehensive research report as an ordinary message (no tool call). Your whole reply is graded, so include the following inline in the report itself:
+   - Full report body (minimum 500 characters)
+   - A "Key Findings" section with 3-10 bullet points
+   - A "Sources" section citing at least 1 URL
 
 Important: This question requires thorough research. Investigate thoroughly before submitting."""
 
@@ -356,35 +340,15 @@ class OpenDeepResearch(Environment):
                 finished=False
             )
 
+    @terminal
     @tool
     async def submit_report(self, params: SubmitReportInput) -> ToolOutput:
-        """
-        Submit your final research report.
-        """
+        """Grade the assistant's final message as a research report (ArenaRL 7-dim judge)."""
 
-        if len(params.key_findings) < 3:
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Insufficient key findings ({len(params.key_findings)}). Minimum 3 required.")],
-                metadata={"error": "insufficient_findings"},
-                reward=0.0,
-                finished=True
-            )
-
-        if len(params.sources_cited) < 1:
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text="No sources cited. At least 1 source required.")],
-                metadata={"error": "no_sources"},
-                reward=0.0,
-                finished=True
-            )
-
-        # Grade the report using LLM with ArenaRL 7-dimension rubric
-        grading_result = await self._grade_report(
-            report=params.report,
-            key_findings=params.key_findings,
-            sources_cited=params.sources_cited,
-            confidence=params.confidence
-        )
+        # Grade the report using LLM with ArenaRL 7-dimension rubric.
+        # Under @terminal the whole reply is `report`; the judge reads inline
+        # Key Findings and Sources sections from that text.
+        grading_result = await self._grade_report(report=params.report)
 
         reward = grading_result["reward"]
         scores = grading_result["scores"]
@@ -406,9 +370,6 @@ ArenaRL Dimension Scores:
 Feedback: {grading_result['feedback']}
 
 Report Length: {len(params.report)} characters
-Key Findings: {len(params.key_findings)}
-Sources Cited: {len(params.sources_cited)}
-Confidence: {params.confidence:.2f}
 """
 
         return ToolOutput(
@@ -419,9 +380,6 @@ Confidence: {params.confidence:.2f}
                 "grading_feedback": grading_result["feedback"],
                 "dimension_scores": scores,
                 "report_length": len(params.report),
-                "num_findings": len(params.key_findings),
-                "num_sources": len(params.sources_cited),
-                "confidence": params.confidence,
                 "query": self.config.query,
                 "has_reference": self.config.has_reference
             },
@@ -429,13 +387,7 @@ Confidence: {params.confidence:.2f}
             finished=True
         )
 
-    async def _grade_report(
-        self,
-        report: str,
-        key_findings: List[str],
-        sources_cited: List[str],
-        confidence: float
-    ) -> Dict:
+    async def _grade_report(self, report: str) -> Dict:
         """
         Use LLM grader with ArenaRL's 7-dimension rubric for Open-DeepResearch.
 
@@ -450,10 +402,8 @@ Confidence: {params.confidence:.2f}
         Reference: https://arxiv.org/abs/2601.06487
 
         Args:
-            report: Research report text
-            key_findings: List of key findings
-            sources_cited: List of source URLs
-            confidence: Agent's confidence score
+            report: Research report text (should include inline "Key Findings"
+                and "Sources" sections per the agent prompt)
 
         Returns:
             Dict with keys: reward (float), feedback (str), scores (dict of 7 dimensions)
@@ -471,21 +421,12 @@ Confidence: {params.confidence:.2f}
 
         async def evaluate_dimension(dimension_name: str, criteria: str) -> tuple[str, float]:
             """Evaluate a single dimension with focused LLM call."""
-            key_findings_text = "\n".join(f"- {f}" for f in key_findings)
-            sources_text = "\n".join(f"- {s}" for s in sources_cited)
-
             prompt = f"""Evaluate this research report on ONE dimension: {dimension_name.upper()}
 
 Research Question: {self.config.query}
 
 Report:
 {report}
-
-Key Findings:
-{key_findings_text}
-
-Sources:
-{sources_text}
 
 Evaluation Criteria - {dimension_name}:
 {criteria}

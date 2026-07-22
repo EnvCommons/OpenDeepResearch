@@ -60,13 +60,12 @@ Source: [Alibaba-NLP/Open-DeepResearch](https://huggingface.co/datasets/Alibaba-
 |------|-------------|
 | `web_search` | Search the web using Tavily API (advanced depth, up to 8 results). |
 | `fetch_url` | Fetch content from a specific URL (max 12,000 characters). |
-| `submit_report` | Submit a research report with key findings, cited sources, and confidence score. |
 
-Note that the `fetch_url` and `web_search` tools require Tavily, but are optional. If you want to use a different provider for search you can exclude these tools and use external tools instead.
+Grading uses a hidden `@terminal` tool: when research is complete, reply with the full research report as an ordinary message. The whole reply is graded by a `gpt-5-mini` ArenaRL 7-dimension judge — include "Key Findings" and "Sources" sections inline in the report so the judge can see them. The `fetch_url` / `web_search` tools require Tavily but are optional.
 
 ## Time Horizon
 
-Open-DeepResearch is a multi-turn environment. Agents perform multiple rounds of web search and content fetching before compiling and submitting a research report.
+Open-DeepResearch is a multi-turn environment. Agents perform multiple rounds of web search and content fetching before finishing with a plain-text report.
 
 ## Environment Difficulty
 
