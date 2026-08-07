@@ -39,6 +39,10 @@ MAX_TOOL_ERROR_CHARS = 120
 TOOL_AWARE_DIMENSIONS = {"tool_usage", "coverage"}
 MAX_REASON_CHARS = 300
 FEEDBACK_DIMENSIONS = 3
+# The judge is the only uncapped call in the env; tavily caps itself at 30-120s.
+# Healthy grades run 32-55s, so 150s leaves ~3x headroom without stalling a trial.
+GRADER_TIMEOUT_S = 150.0
+GRADER_MAX_RETRIES = 3
 TAVILY_ATTEMPTS = 3
 # Credentials that won't recover. 429 is absent on purpose: tavily maps every
 # 429 to UsageLimitExceededError, so a burst rate-limit must retry, not die.
@@ -218,7 +222,11 @@ class OpenDeepResearch(Environment):
             )
 
         # Initialize clients - MUST use secrets, NEVER environment variables
-        self.openai_client = openai.AsyncClient(api_key=openai_api_key)
+        self.openai_client = openai.AsyncClient(
+            api_key=openai_api_key,
+            timeout=GRADER_TIMEOUT_S,
+            max_retries=GRADER_MAX_RETRIES,
+        )
         self.tavily_client = AsyncTavilyClient(api_key=tavily_api_key)
 
         self.tool_log: List[str] = []
