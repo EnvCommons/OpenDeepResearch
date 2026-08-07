@@ -16,11 +16,18 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Awaitable, Callable, Dict, List
 
 import openai
 from pydantic import BaseModel, Field
 from tavily import AsyncTavilyClient
+from tavily.errors import (
+    BadRequestError,
+    ForbiddenError,
+    InvalidAPIKeyError,
+    MissingAPIKeyError,
+    UsageLimitExceededError,
+)
 
 from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, terminal, tool
 
@@ -32,6 +39,10 @@ MAX_TOOL_ERROR_CHARS = 120
 TOOL_AWARE_DIMENSIONS = {"tool_usage", "coverage"}
 MAX_REASON_CHARS = 300
 FEEDBACK_DIMENSIONS = 3
+TAVILY_ATTEMPTS = 3
+# Credentials that won't recover. 429 is absent on purpose: tavily maps every
+# 429 to UsageLimitExceededError, so a burst rate-limit must retry, not die.
+_TAVILY_DEAD = (InvalidAPIKeyError, MissingAPIKeyError, ForbiddenError)
 
 
 # Pydantic schemas for type safety
@@ -255,65 +266,81 @@ class OpenDeepResearch(Environment):
 
         return [TextBlock(type="text", text=prompt_text)]
 
+    async def _tavily(self, call: Callable[[], Awaitable[Any]], what: str) -> Any:
+        """Retry transient Tavily failures; anything but a BadRequestError propagates.
+
+        An outage returned as a normal tool result scores as a bad answer, not a fault.
+        """
+        last: Exception | None = None
+        for attempt in range(TAVILY_ATTEMPTS):
+            try:
+                return await call()
+            except (*_TAVILY_DEAD, BadRequestError):
+                raise
+            except Exception as e:
+                last = e
+                if attempt + 1 < TAVILY_ATTEMPTS:
+                    await asyncio.sleep(2 ** attempt)
+        raise RuntimeError(f"{what} failed after {TAVILY_ATTEMPTS} attempts: {last}") from last
+
     @tool
     async def web_search(self, params: WebSearchInput) -> ToolOutput:
         """
         Search the web using Tavily. Returns search results with titles, URLs, and snippets.
         Use fetch_url tool to get full content from specific URLs if needed.
         """
+        label = f'web_search("{params.query}")'
         try:
             # Use Tavily search API with advanced depth for research
-            response = await self.tavily_client.search(
-                query=params.query,
-                search_depth="advanced",  # More thorough than BrowseComp's "basic"
-                max_results=8  # More results for comprehensive research
-            )
-
-            results = response.get("results", [])
-            if not results:
-                self.tool_log.append(f'web_search("{params.query}") -> 0 results')
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text="No search results found.")],
-                    metadata={"query": params.query, "results": []},
-                    reward=0.0,
-                    finished=False
-                )
-
-            top_urls = "; ".join(r.get("url", "") for r in results[:3])
-            self.tool_log.append(
-                f'web_search("{params.query}") -> {len(results)} results: {top_urls}'
-            )
-
-            # Build display text
-            display_parts = [f"Search results for: {params.query}\n"]
-            for i, result in enumerate(results, 1):
-                title = result.get("title", "No title")
-                url = result.get("url", "")
-                snippet = result.get("content", "")
-                display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
-
-            display_text = "\n".join(display_parts)
-
+            response = await self._tavily(
+                lambda: self.tavily_client.search(
+                    query=params.query,
+                    search_depth="advanced",  # More thorough than BrowseComp's "basic"
+                    max_results=8  # More results for comprehensive research
+                ),
+                label)
+        except BadRequestError as e:
+            self.tool_log.append(f"{label} -> REJECTED: {str(e)[:MAX_TOOL_ERROR_CHARS]}")
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=display_text)],
-                metadata={
-                    "query": params.query,
-                    "results": results,
-                    "count": len(results)
-                },
-                reward=0.0,
+                blocks=[TextBlock(type="text", text=f"Search rejected: {e}")],
+                metadata={"query": params.query, "error": "bad_request", "detail": str(e)},
+                reward=None,
                 finished=False
             )
-        except Exception as e:
-            self.tool_log.append(
-                f'web_search("{params.query}") -> FAILED: {str(e)[:MAX_TOOL_ERROR_CHARS]}'
-            )
+
+        results = response.get("results", [])
+        if not results:
+            self.tool_log.append(f"{label} -> 0 results")
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Web search failed: {str(e)}")],
-                metadata={"query": params.query, "error": str(e)},
-                reward=0.0,
+                blocks=[TextBlock(type="text", text="No search results found.")],
+                metadata={"query": params.query, "results": []},
+                reward=None,
                 finished=False
             )
+
+        top_urls = "; ".join(r.get("url", "") for r in results[:3])
+        self.tool_log.append(f"{label} -> {len(results)} results: {top_urls}")
+
+        # Build display text
+        display_parts = [f"Search results for: {params.query}\n"]
+        for i, result in enumerate(results, 1):
+            title = result.get("title", "No title")
+            url = result.get("url", "")
+            snippet = result.get("content", "")
+            display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
+
+        display_text = "\n".join(display_parts)
+
+        return ToolOutput(
+            blocks=[TextBlock(type="text", text=display_text)],
+            metadata={
+                "query": params.query,
+                "results": results,
+                "count": len(results)
+            },
+            reward=None,
+            finished=False
+        )
 
     @tool
     async def fetch_url(self, params: FetchUrlInput) -> ToolOutput:
@@ -321,48 +348,48 @@ class OpenDeepResearch(Environment):
         Fetch and return the full text content from a specific URL using Tavily's extract method.
         Use this after web_search to get complete information from a page.
         """
+        label = f"fetch_url({params.url})"
         try:
-            response = await self.tavily_client.extract(urls=[params.url])
-
-            results = response.get("results", [])
-            if not results:
-                self.tool_log.append(f"fetch_url({params.url}) -> no content extracted")
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text=f"No content extracted from {params.url}")],
-                    metadata={"url": params.url, "results": []},
-                    reward=0.0,
-                    finished=False
-                )
-
-            result = results[0]
-            raw_content = result.get("raw_content", "")
-
-            # Larger truncation limit for deep research (vs 8000 in BrowseComp)
-            max_length = 12000
-            if len(raw_content) > max_length:
-                raw_content = raw_content[:max_length] + "...\n[Content truncated]"
-
-            self.tool_log.append(f"fetch_url({params.url}) -> {len(raw_content)} chars")
-
+            response = await self._tavily(
+                lambda: self.tavily_client.extract(urls=[params.url]), label)
+        except BadRequestError as e:
+            self.tool_log.append(f"{label} -> REJECTED: {str(e)[:MAX_TOOL_ERROR_CHARS]}")
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Content from {params.url}:\n\n{raw_content}")],
-                metadata={
-                    "url": params.url,
-                    "length": len(raw_content)
-                },
-                reward=0.0,
+                blocks=[TextBlock(type="text", text=f"URL rejected: {e}")],
+                metadata={"url": params.url, "error": "bad_request", "detail": str(e)},
+                reward=None,
                 finished=False
             )
-        except Exception as e:
-            self.tool_log.append(
-                f"fetch_url({params.url}) -> FAILED: {str(e)[:MAX_TOOL_ERROR_CHARS]}"
-            )
+
+        results = response.get("results", [])
+        if not results:
+            self.tool_log.append(f"{label} -> no content extracted")
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Failed to fetch URL: {str(e)}")],
-                metadata={"url": params.url, "error": str(e)},
-                reward=0.0,
+                blocks=[TextBlock(type="text", text=f"No content extracted from {params.url}")],
+                metadata={"url": params.url, "results": []},
+                reward=None,
                 finished=False
             )
+
+        result = results[0]
+        raw_content = result.get("raw_content", "")
+
+        # Larger truncation limit for deep research (vs 8000 in BrowseComp)
+        max_length = 12000
+        if len(raw_content) > max_length:
+            raw_content = raw_content[:max_length] + "...\n[Content truncated]"
+
+        self.tool_log.append(f"{label} -> {len(raw_content)} chars")
+
+        return ToolOutput(
+            blocks=[TextBlock(type="text", text=f"Content from {params.url}:\n\n{raw_content}")],
+            metadata={
+                "url": params.url,
+                "length": len(raw_content)
+            },
+            reward=None,
+            finished=False
+        )
 
     @terminal
     @tool
