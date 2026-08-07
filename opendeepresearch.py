@@ -16,15 +16,37 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Awaitable, Callable, Dict, List
 
 import openai
 from pydantic import BaseModel, Field
 from tavily import AsyncTavilyClient
+from tavily.errors import (
+    BadRequestError,
+    ForbiddenError,
+    InvalidAPIKeyError,
+    MissingAPIKeyError,
+    UsageLimitExceededError,
+)
 
 from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, terminal, tool
 
 from constants import TRAIN_JSONL, TEST_JSONL
+
+
+MAX_TOOL_LOG_ENTRIES = 40
+MAX_TOOL_ERROR_CHARS = 120
+TOOL_AWARE_DIMENSIONS = {"tool_usage", "coverage"}
+MAX_REASON_CHARS = 300
+FEEDBACK_DIMENSIONS = 3
+# The judge is the only uncapped call in the env; tavily caps itself at 30-120s.
+# Healthy grades run 32-55s, so 150s leaves ~3x headroom without stalling a trial.
+GRADER_TIMEOUT_S = 150.0
+GRADER_MAX_RETRIES = 3
+TAVILY_ATTEMPTS = 3
+# Credentials that won't recover. 429 is absent on purpose: tavily maps every
+# 429 to UsageLimitExceededError, so a burst rate-limit must retry, not die.
+_TAVILY_DEAD = (InvalidAPIKeyError, MissingAPIKeyError, ForbiddenError)
 
 
 # Pydantic schemas for type safety
@@ -200,8 +222,14 @@ class OpenDeepResearch(Environment):
             )
 
         # Initialize clients - MUST use secrets, NEVER environment variables
-        self.openai_client = openai.AsyncClient(api_key=openai_api_key)
+        self.openai_client = openai.AsyncClient(
+            api_key=openai_api_key,
+            timeout=GRADER_TIMEOUT_S,
+            max_retries=GRADER_MAX_RETRIES,
+        )
         self.tavily_client = AsyncTavilyClient(api_key=tavily_api_key)
+
+        self.tool_log: List[str] = []
 
     @classmethod
     def list_splits(cls) -> list[str]:
@@ -246,56 +274,81 @@ class OpenDeepResearch(Environment):
 
         return [TextBlock(type="text", text=prompt_text)]
 
+    async def _tavily(self, call: Callable[[], Awaitable[Any]], what: str) -> Any:
+        """Retry transient Tavily failures; anything but a BadRequestError propagates.
+
+        An outage returned as a normal tool result scores as a bad answer, not a fault.
+        """
+        last: Exception | None = None
+        for attempt in range(TAVILY_ATTEMPTS):
+            try:
+                return await call()
+            except (*_TAVILY_DEAD, BadRequestError):
+                raise
+            except Exception as e:
+                last = e
+                if attempt + 1 < TAVILY_ATTEMPTS:
+                    await asyncio.sleep(2 ** attempt)
+        raise RuntimeError(f"{what} failed after {TAVILY_ATTEMPTS} attempts: {last}") from last
+
     @tool
     async def web_search(self, params: WebSearchInput) -> ToolOutput:
         """
         Search the web using Tavily. Returns search results with titles, URLs, and snippets.
         Use fetch_url tool to get full content from specific URLs if needed.
         """
+        label = f'web_search("{params.query}")'
         try:
             # Use Tavily search API with advanced depth for research
-            response = await self.tavily_client.search(
-                query=params.query,
-                search_depth="advanced",  # More thorough than BrowseComp's "basic"
-                max_results=8  # More results for comprehensive research
-            )
-
-            results = response.get("results", [])
-            if not results:
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text="No search results found.")],
-                    metadata={"query": params.query, "results": []},
-                    reward=0.0,
-                    finished=False
-                )
-
-            # Build display text
-            display_parts = [f"Search results for: {params.query}\n"]
-            for i, result in enumerate(results, 1):
-                title = result.get("title", "No title")
-                url = result.get("url", "")
-                snippet = result.get("content", "")
-                display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
-
-            display_text = "\n".join(display_parts)
-
+            response = await self._tavily(
+                lambda: self.tavily_client.search(
+                    query=params.query,
+                    search_depth="advanced",  # More thorough than BrowseComp's "basic"
+                    max_results=8  # More results for comprehensive research
+                ),
+                label)
+        except BadRequestError as e:
+            self.tool_log.append(f"{label} -> REJECTED: {str(e)[:MAX_TOOL_ERROR_CHARS]}")
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=display_text)],
-                metadata={
-                    "query": params.query,
-                    "results": results,
-                    "count": len(results)
-                },
-                reward=0.0,
+                blocks=[TextBlock(type="text", text=f"Search rejected: {e}")],
+                metadata={"query": params.query, "error": "bad_request", "detail": str(e)},
+                reward=None,
                 finished=False
             )
-        except Exception as e:
+
+        results = response.get("results", [])
+        if not results:
+            self.tool_log.append(f"{label} -> 0 results")
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Web search failed: {str(e)}")],
-                metadata={"query": params.query, "error": str(e)},
-                reward=0.0,
+                blocks=[TextBlock(type="text", text="No search results found.")],
+                metadata={"query": params.query, "results": []},
+                reward=None,
                 finished=False
             )
+
+        top_urls = "; ".join(r.get("url", "") for r in results[:3])
+        self.tool_log.append(f"{label} -> {len(results)} results: {top_urls}")
+
+        # Build display text
+        display_parts = [f"Search results for: {params.query}\n"]
+        for i, result in enumerate(results, 1):
+            title = result.get("title", "No title")
+            url = result.get("url", "")
+            snippet = result.get("content", "")
+            display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
+
+        display_text = "\n".join(display_parts)
+
+        return ToolOutput(
+            blocks=[TextBlock(type="text", text=display_text)],
+            metadata={
+                "query": params.query,
+                "results": results,
+                "count": len(results)
+            },
+            reward=None,
+            finished=False
+        )
 
     @tool
     async def fetch_url(self, params: FetchUrlInput) -> ToolOutput:
@@ -303,42 +356,48 @@ class OpenDeepResearch(Environment):
         Fetch and return the full text content from a specific URL using Tavily's extract method.
         Use this after web_search to get complete information from a page.
         """
+        label = f"fetch_url({params.url})"
         try:
-            response = await self.tavily_client.extract(urls=[params.url])
-
-            results = response.get("results", [])
-            if not results:
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text=f"No content extracted from {params.url}")],
-                    metadata={"url": params.url, "results": []},
-                    reward=0.0,
-                    finished=False
-                )
-
-            result = results[0]
-            raw_content = result.get("raw_content", "")
-
-            # Larger truncation limit for deep research (vs 8000 in BrowseComp)
-            max_length = 12000
-            if len(raw_content) > max_length:
-                raw_content = raw_content[:max_length] + "...\n[Content truncated]"
-
+            response = await self._tavily(
+                lambda: self.tavily_client.extract(urls=[params.url]), label)
+        except BadRequestError as e:
+            self.tool_log.append(f"{label} -> REJECTED: {str(e)[:MAX_TOOL_ERROR_CHARS]}")
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Content from {params.url}:\n\n{raw_content}")],
-                metadata={
-                    "url": params.url,
-                    "length": len(raw_content)
-                },
-                reward=0.0,
+                blocks=[TextBlock(type="text", text=f"URL rejected: {e}")],
+                metadata={"url": params.url, "error": "bad_request", "detail": str(e)},
+                reward=None,
                 finished=False
             )
-        except Exception as e:
+
+        results = response.get("results", [])
+        if not results:
+            self.tool_log.append(f"{label} -> no content extracted")
             return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Failed to fetch URL: {str(e)}")],
-                metadata={"url": params.url, "error": str(e)},
-                reward=0.0,
+                blocks=[TextBlock(type="text", text=f"No content extracted from {params.url}")],
+                metadata={"url": params.url, "results": []},
+                reward=None,
                 finished=False
             )
+
+        result = results[0]
+        raw_content = result.get("raw_content", "")
+
+        # Larger truncation limit for deep research (vs 8000 in BrowseComp)
+        max_length = 12000
+        if len(raw_content) > max_length:
+            raw_content = raw_content[:max_length] + "...\n[Content truncated]"
+
+        self.tool_log.append(f"{label} -> {len(raw_content)} chars")
+
+        return ToolOutput(
+            blocks=[TextBlock(type="text", text=f"Content from {params.url}:\n\n{raw_content}")],
+            metadata={
+                "url": params.url,
+                "length": len(raw_content)
+            },
+            reward=None,
+            finished=False
+        )
 
     @terminal
     @tool
@@ -367,7 +426,8 @@ ArenaRL Dimension Scores:
 - Depth: {scores.get('depth', 0.0):.2f}
 - Clarity: {scores.get('clarity', 0.0):.2f}
 
-Feedback: {grading_result['feedback']}
+Feedback:
+{grading_result['feedback']}
 
 Report Length: {len(params.report)} characters
 """
@@ -379,7 +439,10 @@ Report Length: {len(params.report)} characters
                 "reward": reward,
                 "grading_feedback": grading_result["feedback"],
                 "dimension_scores": scores,
+                "dimension_reasons": grading_result["reasons"],
                 "report_length": len(params.report),
+                "tool_call_count": len(self.tool_log),
+                "tool_log": self.tool_log,
                 "query": self.config.query,
                 "has_reference": self.config.has_reference
             },
@@ -406,28 +469,51 @@ Report Length: {len(params.report)} characters
                 and "Sources" sections per the agent prompt)
 
         Returns:
-            Dict with keys: reward (float), feedback (str), scores (dict of 7 dimensions)
+            Dict with keys: reward (float), feedback (str), scores (dict of 7
+            dimensions), reasons (dict of the judge's per-dimension justification)
+
+        Raises:
+            ValueError: If a judge reply has no parseable score, or scores
+                outside 0.0-1.0
         """
         # Define all 7 dimensions with specific evaluation criteria
         dimensions = {
             "framework": "Structural completeness and logical coherence. Score 0.0-1.0.",
-            "tool_usage": "Appropriateness and efficiency of tool invocations (search queries, URL fetching). Score 0.0-1.0.",
-            "coverage": "Sufficiency of retrieved information - breadth of sources and aspects covered. Score 0.0-1.0.",
+            "tool_usage": "Appropriateness and efficiency of the listed tool invocations - were the search queries well targeted, did they diversify rather than repeat, were promising URLs followed up, were calls wasted on failures or duplicates? Judge the tool calls themselves, not the agent's description of them. Score 0.0-1.0.",
+            "coverage": "Sufficiency of retrieved information - breadth of sources and aspects actually covered by the listed tool calls and carried into the report. Score 0.0-1.0.",
             "relevance": "How well the report addresses the specific research question. Score 0.0-1.0.",
             "accuracy": "Factual correctness, consistency, and plausibility of claims. Score 0.0-1.0.",
             "depth": "Analytical depth, synthesis, and reasoning coherence beyond surface-level facts. Score 0.0-1.0.",
             "clarity": "Organization, readability, and practical usability of the report. Score 0.0-1.0."
         }
 
-        async def evaluate_dimension(dimension_name: str, criteria: str) -> tuple[str, float]:
+        # Not recoverable from the report text, which is the agent's own account.
+        if self.tool_log:
+            shown = self.tool_log[:MAX_TOOL_LOG_ENTRIES]
+            transcript_lines = [f"{i}. {entry}" for i, entry in enumerate(shown, 1)]
+            omitted = len(self.tool_log) - len(shown)
+            if omitted:
+                transcript_lines.append(f"... {omitted} further call(s) omitted")
+            tool_transcript = "\n".join(transcript_lines)
+        else:
+            tool_transcript = (
+                "(none - the agent produced this report without searching "
+                "or fetching anything)"
+            )
+
+        async def evaluate_dimension(dimension_name: str, criteria: str) -> tuple[str, float, str]:
             """Evaluate a single dimension with focused LLM call."""
+            tool_context = ""
+            if dimension_name in TOOL_AWARE_DIMENSIONS:
+                tool_context = f"\nTool calls made during research:\n{tool_transcript}\n"
+
             prompt = f"""Evaluate this research report on ONE dimension: {dimension_name.upper()}
 
 Research Question: {self.config.query}
 
 Report:
 {report}
-
+{tool_context}
 Evaluation Criteria - {dimension_name}:
 {criteria}
 
@@ -447,14 +533,27 @@ Reason: <brief justification>"""
 
             content = response.choices[0].message.content or ""
 
-            # Parse score
-            score_match = re.search(r"Score:\s*([0-9.]+)", content)
-            score = float(score_match.group(1)) if score_match else 0.5
+            # A malformed judge reply must surface as an error: any default here
+            # is indistinguishable from a real score once the run is over.
+            score_match = re.search(r"Score:\s*([0-9]*\.?[0-9]+)", content)
+            if not score_match:
+                raise ValueError(
+                    f"Judge reply for dimension '{dimension_name}' has no parseable "
+                    f"'Score:' value. Got: {content[:200]!r}"
+                )
 
-            # Clamp to valid range
-            score = max(0.0, min(1.0, score))
+            score = float(score_match.group(1))
+            if not 0.0 <= score <= 1.0:
+                raise ValueError(
+                    f"Judge scored dimension '{dimension_name}' at {score}, outside "
+                    f"the 0.0-1.0 range it was asked for. Got: {content[:200]!r}"
+                )
 
-            return dimension_name, score
+            # Feedback only, so a missing reason degrades rather than failing the grade.
+            reason_match = re.search(r"Reason:\s*(.+)", content, re.DOTALL)
+            reason = reason_match.group(1).strip()[:MAX_REASON_CHARS] if reason_match else ""
+
+            return dimension_name, score, reason
 
         # Evaluate all 7 dimensions in parallel
         results = await asyncio.gather(
@@ -462,7 +561,8 @@ Reason: <brief justification>"""
         )
 
         # Combine results
-        scores = dict(results)
+        scores = {name: score for name, score, _ in results}
+        reasons = {name: reason for name, _, reason in results}
 
         # Calculate weighted reward (ArenaRL weights)
         weights = {
@@ -477,10 +577,21 @@ Reason: <brief justification>"""
 
         reward = sum(scores[dim] * weight for dim, weight in weights.items())
 
+        # Lead with the dimensions that cost the most, so the agent learns what
+        # to fix rather than re-reading a number it was already shown.
+        weakest = sorted(scores, key=lambda dim: scores[dim])[:FEEDBACK_DIMENSIONS]
+        feedback_lines = [f"Overall quality: {reward:.2f}/1.0"]
+        feedback_lines += [
+            f"- {dim} ({scores[dim]:.2f}): {reasons[dim]}"
+            for dim in weakest
+            if scores[dim] < 1.0 and reasons[dim]
+        ]
+
         return {
             "reward": max(0.0, min(1.0, reward)),
             "scores": scores,
-            "feedback": f"Overall quality: {reward:.2f}/1.0"
+            "reasons": reasons,
+            "feedback": "\n".join(feedback_lines)
         }
 
 
