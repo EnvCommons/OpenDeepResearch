@@ -30,6 +30,8 @@ from constants import TRAIN_JSONL, TEST_JSONL
 MAX_TOOL_LOG_ENTRIES = 40
 MAX_TOOL_ERROR_CHARS = 120
 TOOL_AWARE_DIMENSIONS = {"tool_usage", "coverage"}
+MAX_REASON_CHARS = 300
+FEEDBACK_DIMENSIONS = 3
 
 
 # Pydantic schemas for type safety
@@ -389,7 +391,8 @@ ArenaRL Dimension Scores:
 - Depth: {scores.get('depth', 0.0):.2f}
 - Clarity: {scores.get('clarity', 0.0):.2f}
 
-Feedback: {grading_result['feedback']}
+Feedback:
+{grading_result['feedback']}
 
 Report Length: {len(params.report)} characters
 """
@@ -401,6 +404,7 @@ Report Length: {len(params.report)} characters
                 "reward": reward,
                 "grading_feedback": grading_result["feedback"],
                 "dimension_scores": scores,
+                "dimension_reasons": grading_result["reasons"],
                 "report_length": len(params.report),
                 "tool_call_count": len(self.tool_log),
                 "tool_log": self.tool_log,
@@ -430,7 +434,12 @@ Report Length: {len(params.report)} characters
                 and "Sources" sections per the agent prompt)
 
         Returns:
-            Dict with keys: reward (float), feedback (str), scores (dict of 7 dimensions)
+            Dict with keys: reward (float), feedback (str), scores (dict of 7
+            dimensions), reasons (dict of the judge's per-dimension justification)
+
+        Raises:
+            ValueError: If a judge reply has no parseable score, or scores
+                outside 0.0-1.0
         """
         # Define all 7 dimensions with specific evaluation criteria
         dimensions = {
@@ -457,7 +466,7 @@ Report Length: {len(params.report)} characters
                 "or fetching anything)"
             )
 
-        async def evaluate_dimension(dimension_name: str, criteria: str) -> tuple[str, float]:
+        async def evaluate_dimension(dimension_name: str, criteria: str) -> tuple[str, float, str]:
             """Evaluate a single dimension with focused LLM call."""
             tool_context = ""
             if dimension_name in TOOL_AWARE_DIMENSIONS:
@@ -489,14 +498,27 @@ Reason: <brief justification>"""
 
             content = response.choices[0].message.content or ""
 
-            # Parse score
-            score_match = re.search(r"Score:\s*([0-9.]+)", content)
-            score = float(score_match.group(1)) if score_match else 0.5
+            # A malformed judge reply must surface as an error: any default here
+            # is indistinguishable from a real score once the run is over.
+            score_match = re.search(r"Score:\s*([0-9]*\.?[0-9]+)", content)
+            if not score_match:
+                raise ValueError(
+                    f"Judge reply for dimension '{dimension_name}' has no parseable "
+                    f"'Score:' value. Got: {content[:200]!r}"
+                )
 
-            # Clamp to valid range
-            score = max(0.0, min(1.0, score))
+            score = float(score_match.group(1))
+            if not 0.0 <= score <= 1.0:
+                raise ValueError(
+                    f"Judge scored dimension '{dimension_name}' at {score}, outside "
+                    f"the 0.0-1.0 range it was asked for. Got: {content[:200]!r}"
+                )
 
-            return dimension_name, score
+            # Feedback only, so a missing reason degrades rather than failing the grade.
+            reason_match = re.search(r"Reason:\s*(.+)", content, re.DOTALL)
+            reason = reason_match.group(1).strip()[:MAX_REASON_CHARS] if reason_match else ""
+
+            return dimension_name, score, reason
 
         # Evaluate all 7 dimensions in parallel
         results = await asyncio.gather(
@@ -504,7 +526,8 @@ Reason: <brief justification>"""
         )
 
         # Combine results
-        scores = dict(results)
+        scores = {name: score for name, score, _ in results}
+        reasons = {name: reason for name, _, reason in results}
 
         # Calculate weighted reward (ArenaRL weights)
         weights = {
@@ -519,10 +542,21 @@ Reason: <brief justification>"""
 
         reward = sum(scores[dim] * weight for dim, weight in weights.items())
 
+        # Lead with the dimensions that cost the most, so the agent learns what
+        # to fix rather than re-reading a number it was already shown.
+        weakest = sorted(scores, key=lambda dim: scores[dim])[:FEEDBACK_DIMENSIONS]
+        feedback_lines = [f"Overall quality: {reward:.2f}/1.0"]
+        feedback_lines += [
+            f"- {dim} ({scores[dim]:.2f}): {reasons[dim]}"
+            for dim in weakest
+            if scores[dim] < 1.0 and reasons[dim]
+        ]
+
         return {
             "reward": max(0.0, min(1.0, reward)),
             "scores": scores,
-            "feedback": f"Overall quality: {reward:.2f}/1.0"
+            "reasons": reasons,
+            "feedback": "\n".join(feedback_lines)
         }
 
 
