@@ -27,6 +27,11 @@ from openreward.environments import Environment, JSONObject, Server, TextBlock, 
 from constants import TRAIN_JSONL, TEST_JSONL
 
 
+MAX_TOOL_LOG_ENTRIES = 40
+MAX_TOOL_ERROR_CHARS = 120
+TOOL_AWARE_DIMENSIONS = {"tool_usage", "coverage"}
+
+
 # Pydantic schemas for type safety
 class TaskSpec(BaseModel):
     """Task specification for OpenDeepResearch environment"""
@@ -203,6 +208,8 @@ class OpenDeepResearch(Environment):
         self.openai_client = openai.AsyncClient(api_key=openai_api_key)
         self.tavily_client = AsyncTavilyClient(api_key=tavily_api_key)
 
+        self.tool_log: List[str] = []
+
     @classmethod
     def list_splits(cls) -> list[str]:
         """Return available dataset splits."""
@@ -262,12 +269,18 @@ class OpenDeepResearch(Environment):
 
             results = response.get("results", [])
             if not results:
+                self.tool_log.append(f'web_search("{params.query}") -> 0 results')
                 return ToolOutput(
                     blocks=[TextBlock(type="text", text="No search results found.")],
                     metadata={"query": params.query, "results": []},
                     reward=0.0,
                     finished=False
                 )
+
+            top_urls = "; ".join(r.get("url", "") for r in results[:3])
+            self.tool_log.append(
+                f'web_search("{params.query}") -> {len(results)} results: {top_urls}'
+            )
 
             # Build display text
             display_parts = [f"Search results for: {params.query}\n"]
@@ -290,6 +303,9 @@ class OpenDeepResearch(Environment):
                 finished=False
             )
         except Exception as e:
+            self.tool_log.append(
+                f'web_search("{params.query}") -> FAILED: {str(e)[:MAX_TOOL_ERROR_CHARS]}'
+            )
             return ToolOutput(
                 blocks=[TextBlock(type="text", text=f"Web search failed: {str(e)}")],
                 metadata={"query": params.query, "error": str(e)},
@@ -308,6 +324,7 @@ class OpenDeepResearch(Environment):
 
             results = response.get("results", [])
             if not results:
+                self.tool_log.append(f"fetch_url({params.url}) -> no content extracted")
                 return ToolOutput(
                     blocks=[TextBlock(type="text", text=f"No content extracted from {params.url}")],
                     metadata={"url": params.url, "results": []},
@@ -323,6 +340,8 @@ class OpenDeepResearch(Environment):
             if len(raw_content) > max_length:
                 raw_content = raw_content[:max_length] + "...\n[Content truncated]"
 
+            self.tool_log.append(f"fetch_url({params.url}) -> {len(raw_content)} chars")
+
             return ToolOutput(
                 blocks=[TextBlock(type="text", text=f"Content from {params.url}:\n\n{raw_content}")],
                 metadata={
@@ -333,6 +352,9 @@ class OpenDeepResearch(Environment):
                 finished=False
             )
         except Exception as e:
+            self.tool_log.append(
+                f"fetch_url({params.url}) -> FAILED: {str(e)[:MAX_TOOL_ERROR_CHARS]}"
+            )
             return ToolOutput(
                 blocks=[TextBlock(type="text", text=f"Failed to fetch URL: {str(e)}")],
                 metadata={"url": params.url, "error": str(e)},
@@ -380,6 +402,8 @@ Report Length: {len(params.report)} characters
                 "grading_feedback": grading_result["feedback"],
                 "dimension_scores": scores,
                 "report_length": len(params.report),
+                "tool_call_count": len(self.tool_log),
+                "tool_log": self.tool_log,
                 "query": self.config.query,
                 "has_reference": self.config.has_reference
             },
@@ -411,23 +435,41 @@ Report Length: {len(params.report)} characters
         # Define all 7 dimensions with specific evaluation criteria
         dimensions = {
             "framework": "Structural completeness and logical coherence. Score 0.0-1.0.",
-            "tool_usage": "Appropriateness and efficiency of tool invocations (search queries, URL fetching). Score 0.0-1.0.",
-            "coverage": "Sufficiency of retrieved information - breadth of sources and aspects covered. Score 0.0-1.0.",
+            "tool_usage": "Appropriateness and efficiency of the listed tool invocations - were the search queries well targeted, did they diversify rather than repeat, were promising URLs followed up, were calls wasted on failures or duplicates? Judge the tool calls themselves, not the agent's description of them. Score 0.0-1.0.",
+            "coverage": "Sufficiency of retrieved information - breadth of sources and aspects actually covered by the listed tool calls and carried into the report. Score 0.0-1.0.",
             "relevance": "How well the report addresses the specific research question. Score 0.0-1.0.",
             "accuracy": "Factual correctness, consistency, and plausibility of claims. Score 0.0-1.0.",
             "depth": "Analytical depth, synthesis, and reasoning coherence beyond surface-level facts. Score 0.0-1.0.",
             "clarity": "Organization, readability, and practical usability of the report. Score 0.0-1.0."
         }
 
+        # Not recoverable from the report text, which is the agent's own account.
+        if self.tool_log:
+            shown = self.tool_log[:MAX_TOOL_LOG_ENTRIES]
+            transcript_lines = [f"{i}. {entry}" for i, entry in enumerate(shown, 1)]
+            omitted = len(self.tool_log) - len(shown)
+            if omitted:
+                transcript_lines.append(f"... {omitted} further call(s) omitted")
+            tool_transcript = "\n".join(transcript_lines)
+        else:
+            tool_transcript = (
+                "(none - the agent produced this report without searching "
+                "or fetching anything)"
+            )
+
         async def evaluate_dimension(dimension_name: str, criteria: str) -> tuple[str, float]:
             """Evaluate a single dimension with focused LLM call."""
+            tool_context = ""
+            if dimension_name in TOOL_AWARE_DIMENSIONS:
+                tool_context = f"\nTool calls made during research:\n{tool_transcript}\n"
+
             prompt = f"""Evaluate this research report on ONE dimension: {dimension_name.upper()}
 
 Research Question: {self.config.query}
 
 Report:
 {report}
-
+{tool_context}
 Evaluation Criteria - {dimension_name}:
 {criteria}
 
