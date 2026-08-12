@@ -59,9 +59,9 @@ Source: [Alibaba-NLP/Open-DeepResearch](https://huggingface.co/datasets/Alibaba-
 | Tool | Description |
 |------|-------------|
 | `web_search` | Search the web using Tavily API (advanced depth, up to 8 results). |
-| `fetch_url` | Fetch content from a specific URL (max 12,000 characters). |
+| `web_fetch` | Fetch content from a specific URL (max 12,000 characters). |
 
-Grading uses a hidden `@terminal` tool: when research is complete, reply with the full research report as an ordinary message. The whole reply is graded by a `gpt-5-mini` ArenaRL 7-dimension judge — include "Key Findings" and "Sources" sections inline in the report so the judge can see them. The `fetch_url` / `web_search` tools require Tavily but are optional.
+Grading uses a hidden `@terminal` tool: when research is complete, reply with the full research report as an ordinary message. The whole reply is graded by a `gpt-5-mini` ArenaRL 7-dimension judge — include "Key Findings" and "Sources" sections inline in the report so the judge can see them. The `web_fetch` / `web_search` tools require Tavily but are optional.
 
 ## Time Horizon
 

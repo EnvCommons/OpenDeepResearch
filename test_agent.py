@@ -1,6 +1,6 @@
 """Test agent for Open-DeepResearch (terminal-tool style).
 
-The agent uses `web_search` + `fetch_url` to research a question, then replies
+The agent uses `web_search` + `web_fetch` to research a question, then replies
 with a plain-text research report. The @terminal grader runs the ArenaRL
 7-dimension judge (gpt-5-mini) against the whole reply — the report should
 include inline "Key Findings" and "Sources" sections so the judge sees them.
@@ -36,10 +36,12 @@ async def main():
     NUM_TASKS = int(os.environ.get("NUM_TASKS", "1"))
     MAX_TURNS = int(os.environ.get("MAX_TURNS", "40"))
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    # Optional: whichever the server's OPENREWARD_SEARCH_BACKEND needs.
     TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+    OPENREWARD_API_KEY = os.getenv("OPENREWARD_API_KEY")
 
-    if not OPENAI_API_KEY or not TAVILY_API_KEY:
-        raise ValueError("OPENAI_API_KEY and TAVILY_API_KEY required")
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY required")
 
     base_url = "http://localhost:8080" if os.environ.get("LOCAL") else None
     environment = or_client.environments.get(name=ENV_NAME, base_url=base_url)
@@ -60,7 +62,9 @@ async def main():
 
         async with environment.session(
             task=task,
-            secrets={"openai_api_key": OPENAI_API_KEY, "tavily_api_key": TAVILY_API_KEY},
+            secrets={"openai_api_key": OPENAI_API_KEY,
+                     **({"tavily_api_key": TAVILY_API_KEY} if TAVILY_API_KEY else {}),
+                     **({"api_key": OPENREWARD_API_KEY} if OPENREWARD_API_KEY else {})},
         ) as session:
             assistant_ends_rollout = await session.is_assistant_message_final()
             session_tools = await session.list_tools()

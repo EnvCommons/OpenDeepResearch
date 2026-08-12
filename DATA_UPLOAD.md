@@ -54,7 +54,7 @@ This environment requires two API keys to function:
 
 2. **Tavily API Key** - For web search and URL content extraction
    - Get yours at: https://tavily.com
-   - Required for: web_search and fetch_url tools
+   - Required for: web_search and web_fetch tools
 
 Pass both keys when creating a session:
 ```python

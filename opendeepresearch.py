@@ -20,16 +20,9 @@ from typing import Any, Awaitable, Callable, Dict, List
 
 import openai
 from pydantic import BaseModel, Field
-from tavily import AsyncTavilyClient
-from tavily.errors import (
-    BadRequestError,
-    ForbiddenError,
-    InvalidAPIKeyError,
-    MissingAPIKeyError,
-    UsageLimitExceededError,
-)
 
 from openreward.environments import Environment, JSONObject, Server, TextBlock, ToolOutput, terminal, tool
+from openreward.toolsets import WebToolset
 
 from constants import TRAIN_JSONL, TEST_JSONL
 
@@ -39,14 +32,10 @@ MAX_TOOL_ERROR_CHARS = 120
 TOOL_AWARE_DIMENSIONS = {"tool_usage", "coverage"}
 MAX_REASON_CHARS = 300
 FEEDBACK_DIMENSIONS = 3
-# The judge is the only uncapped call in the env; tavily caps itself at 30-120s.
+# The judge is the only uncapped call in the env; the search backend caps itself.
 # Healthy grades run 32-55s, so 150s leaves ~3x headroom without stalling a trial.
 GRADER_TIMEOUT_S = 150.0
 GRADER_MAX_RETRIES = 3
-TAVILY_ATTEMPTS = 3
-# Credentials that won't recover. 429 is absent on purpose: tavily maps every
-# 429 to UsageLimitExceededError, so a burst rate-limit must retry, not die.
-_TAVILY_DEAD = (InvalidAPIKeyError, MissingAPIKeyError, ForbiddenError)
 
 
 # Pydantic schemas for type safety
@@ -56,16 +45,6 @@ class TaskSpec(BaseModel):
     query: str
     split: str
     has_reference: bool
-
-
-class WebSearchInput(BaseModel):
-    """Parameters for web_search tool"""
-    query: str = Field(..., description="Search query string")
-
-
-class FetchUrlInput(BaseModel):
-    """Parameters for fetch_url tool"""
-    url: str = Field(..., description="URL to fetch content from")
 
 
 class SubmitReportInput(BaseModel):
@@ -88,7 +67,7 @@ CHINESE_INSTRUCTIONS = """您的任务是对这个研究问题进行深入调查
 1. web_search(query: str) - 搜索网络信息
    - 返回标题、URL和摘要
    - 可以多次搜索以从不同角度收集信息
-2. fetch_url(url: str) - 获取特定URL的完整内容
+2. web_fetch(url: str) - 获取特定URL的完整内容
    - 在web_search之后使用此工具阅读完整页面
    - 有助于提取详细信息
 
@@ -111,7 +90,7 @@ Available Tools:
 1. web_search(query: str) - Search for information
    - Returns titles, URLs, and snippets
    - You can search multiple times from different angles
-2. fetch_url(url: str) - Fetch full content from a specific URL
+2. web_fetch(url: str, prompt: str) - Fetch the content of a specific URL
    - Use after web_search to read complete pages
    - Helpful for extracting detailed information
 
@@ -119,7 +98,7 @@ Instructions:
 1. Use web_search to find relevant information
    - Consider searching for key entities, dates, or concepts mentioned
    - Questions often require multi-hop reasoning across multiple searches
-2. Use fetch_url to get complete content from promising URLs
+2. Use web_fetch to get complete content from promising URLs
 3. When ready, reply with your comprehensive research report as an ordinary message (no tool call). Your whole reply is graded, so include the following inline in the report itself:
    - Full report body (minimum 500 characters)
    - A "Key Findings" section with 3-10 bullet points
@@ -175,7 +154,7 @@ class OpenDeepResearch(Environment):
     Agent workflow:
     1. Receives a research question (Chinese or English)
     2. Uses web_search tool to gather information (multiple searches allowed)
-    3. Uses fetch_url tool to read detailed content from URLs
+    3. Uses web_fetch tool to read detailed content from URLs
     4. Submits comprehensive research report via submit_report
     5. Report is graded by gpt-5-mini on 7 ArenaRL dimensions in parallel
     6. Receives reward (0.0-1.0) with dimension scores and feedback
@@ -192,13 +171,27 @@ class OpenDeepResearch(Environment):
     Reference: https://arxiv.org/abs/2601.06487
     """
 
+    # web_search / web_fetch come from the SDK rather than being hand-rolled here.
+    # Which provider answers is process configuration (OPENREWARD_SEARCH_BACKEND,
+    # default "backsearch"), so changing search provider needs no change here.
+    #
+    # The toolset owns the error split too: an unfetchable page stays tool output
+    # the agent can act on, while a missing key or exhausted quota raises so the
+    # rollout ends with a blank reward rather than a score that reads as a bad answer.
+    toolsets = [WebToolset]
+
+    # Search hits keep their snippets, as the prompt promises. Off in the SDK by
+    # default, which would force a fetch per candidate just to triage results.
+    web_include_snippets = True
+
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
         """
         Initialize OpenDeepResearch environment.
 
         Args:
             task_spec: Task specification with id, query, split, has_reference
-            secrets: Must contain "openai_api_key" for grading and "tavily_api_key" for search
+            secrets: Must contain "openai_api_key" for grading; search credentials
+                (api_key / tavily_api_key) are forwarded to the search backend
 
         Raises:
             ValueError: If required API keys missing or task_spec invalid
@@ -211,15 +204,14 @@ class OpenDeepResearch(Environment):
         if not openai_api_key:
             raise ValueError(
                 "openai_api_key required in secrets parameter for LLM grading. "
-                "Pass secrets={'openai_api_key': 'sk-...', 'tavily_api_key': 'tvly-...'} when creating session."
+                "Pass secrets={'openai_api_key': 'sk-...'} when creating session."
             )
 
-        tavily_api_key = secrets.get("tavily_api_key")
-        if not tavily_api_key:
-            raise ValueError(
-                "tavily_api_key required in secrets parameter for web search. "
-                "Pass secrets={'openai_api_key': 'sk-...', 'tavily_api_key': 'tvly-...'} when creating session."
-            )
+        # Read live by WebToolset on every tool call, so the search backend takes its
+        # credentials from the session rather than the server process. The configured
+        # backend picks the key it needs: `api_key` for backsearch, `tavily_api_key`
+        # for tavily. No up-front check — which key is required depends on the backend.
+        self.search_secrets = secrets
 
         # Initialize clients - MUST use secrets, NEVER environment variables
         self.openai_client = openai.AsyncClient(
@@ -227,7 +219,6 @@ class OpenDeepResearch(Environment):
             timeout=GRADER_TIMEOUT_S,
             max_retries=GRADER_MAX_RETRIES,
         )
-        self.tavily_client = AsyncTavilyClient(api_key=tavily_api_key)
 
         self.tool_log: List[str] = []
 
@@ -273,131 +264,6 @@ class OpenDeepResearch(Environment):
 {instructions}"""
 
         return [TextBlock(type="text", text=prompt_text)]
-
-    async def _tavily(self, call: Callable[[], Awaitable[Any]], what: str) -> Any:
-        """Retry transient Tavily failures; anything but a BadRequestError propagates.
-
-        An outage returned as a normal tool result scores as a bad answer, not a fault.
-        """
-        last: Exception | None = None
-        for attempt in range(TAVILY_ATTEMPTS):
-            try:
-                return await call()
-            except (*_TAVILY_DEAD, BadRequestError):
-                raise
-            except Exception as e:
-                last = e
-                if attempt + 1 < TAVILY_ATTEMPTS:
-                    await asyncio.sleep(2 ** attempt)
-        raise RuntimeError(f"{what} failed after {TAVILY_ATTEMPTS} attempts: {last}") from last
-
-    @tool
-    async def web_search(self, params: WebSearchInput) -> ToolOutput:
-        """
-        Search the web using Tavily. Returns search results with titles, URLs, and snippets.
-        Use fetch_url tool to get full content from specific URLs if needed.
-        """
-        label = f'web_search("{params.query}")'
-        try:
-            # Use Tavily search API with advanced depth for research
-            response = await self._tavily(
-                lambda: self.tavily_client.search(
-                    query=params.query,
-                    search_depth="advanced",  # More thorough than BrowseComp's "basic"
-                    max_results=8  # More results for comprehensive research
-                ),
-                label)
-        except BadRequestError as e:
-            self.tool_log.append(f"{label} -> REJECTED: {str(e)[:MAX_TOOL_ERROR_CHARS]}")
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Search rejected: {e}")],
-                metadata={"query": params.query, "error": "bad_request", "detail": str(e)},
-                reward=None,
-                finished=False
-            )
-
-        results = response.get("results", [])
-        if not results:
-            self.tool_log.append(f"{label} -> 0 results")
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text="No search results found.")],
-                metadata={"query": params.query, "results": []},
-                reward=None,
-                finished=False
-            )
-
-        top_urls = "; ".join(r.get("url", "") for r in results[:3])
-        self.tool_log.append(f"{label} -> {len(results)} results: {top_urls}")
-
-        # Build display text
-        display_parts = [f"Search results for: {params.query}\n"]
-        for i, result in enumerate(results, 1):
-            title = result.get("title", "No title")
-            url = result.get("url", "")
-            snippet = result.get("content", "")
-            display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
-
-        display_text = "\n".join(display_parts)
-
-        return ToolOutput(
-            blocks=[TextBlock(type="text", text=display_text)],
-            metadata={
-                "query": params.query,
-                "results": results,
-                "count": len(results)
-            },
-            reward=None,
-            finished=False
-        )
-
-    @tool
-    async def fetch_url(self, params: FetchUrlInput) -> ToolOutput:
-        """
-        Fetch and return the full text content from a specific URL using Tavily's extract method.
-        Use this after web_search to get complete information from a page.
-        """
-        label = f"fetch_url({params.url})"
-        try:
-            response = await self._tavily(
-                lambda: self.tavily_client.extract(urls=[params.url]), label)
-        except BadRequestError as e:
-            self.tool_log.append(f"{label} -> REJECTED: {str(e)[:MAX_TOOL_ERROR_CHARS]}")
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"URL rejected: {e}")],
-                metadata={"url": params.url, "error": "bad_request", "detail": str(e)},
-                reward=None,
-                finished=False
-            )
-
-        results = response.get("results", [])
-        if not results:
-            self.tool_log.append(f"{label} -> no content extracted")
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"No content extracted from {params.url}")],
-                metadata={"url": params.url, "results": []},
-                reward=None,
-                finished=False
-            )
-
-        result = results[0]
-        raw_content = result.get("raw_content", "")
-
-        # Larger truncation limit for deep research (vs 8000 in BrowseComp)
-        max_length = 12000
-        if len(raw_content) > max_length:
-            raw_content = raw_content[:max_length] + "...\n[Content truncated]"
-
-        self.tool_log.append(f"{label} -> {len(raw_content)} chars")
-
-        return ToolOutput(
-            blocks=[TextBlock(type="text", text=f"Content from {params.url}:\n\n{raw_content}")],
-            metadata={
-                "url": params.url,
-                "length": len(raw_content)
-            },
-            reward=None,
-            finished=False
-        )
 
     @terminal
     @tool
